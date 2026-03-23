@@ -60,8 +60,8 @@ NODE_RANK=${SLURM_NODEID:-0}
 
 export MASTER_ADDR=$(scontrol show hostname "$SLURM_NODELIST" | head -n 1)
 export MASTER_PORT=12345
-export NCCL_ASYNC_ERROR_HANDLING=1
-export TORCH_NCCL_TRACE_BUFFER_SIZE=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_FR_BUFFER_SIZE=1
 
 torchrun \
     --nnodes=$NUM_NODES \

@@ -15,13 +15,12 @@ from torch.utils.data import random_split, DataLoader
 from peft import LoraConfig, get_peft_model, TaskType
 from bert_score import score, BERTScorer
 from sacrebleu import corpus_bleu
-from data_classes import ParaNMTIterableDataset, CachedIterableDataset, build_cache, build_paranmt_multi_cache, CachedParaNMTMultiDataset
+from data_classes import ParaNMTIterableDataset, CachedIterableDataset, build_cache, build_paranmt_multi_cache, CachedParaNMTMultiDataset, _safe_torch_load
 
 
 def compute_bertscore(preds, refs):
-    # scorer = _get_bertscorer()
-    # P, R, F1 = scorer.score(preds, refs)
-    P, R, F1 = score(preds, refs)
+    scorer = _get_bertscorer()
+    P, R, F1 = scorer.score(preds, refs)
     return F1.mean().item()
 
 def compute_bleu(preds, refs):
@@ -86,7 +85,12 @@ def evaluate(model, loader, tokenizer, eval_mode="gather_preds"):
     if not is_main_process():
         return None
 
-    bert = compute_bertscore(preds, refs)
+    try:
+        bert = compute_bertscore(preds, refs)
+    except Exception as e:
+        if is_main_process():
+            logger.exception("BERTScore failed; setting to 0.0", exc_info=e)
+        bert = 0.0
     bleu = compute_bleu(preds, refs)
 
     return {
@@ -111,6 +115,27 @@ def log_mem(prefix=""):
     log_cpu_mem(prefix)
     log_gpu_mem(prefix)
 
+def compute_min_steps_per_epoch(cache_dir, batch_size, num_workers):
+    # Estimate per-rank batches from cached shard sizes and take global min
+    files = sorted(glob.glob(os.path.join(cache_dir, "*.pt")))
+    rank = dist.get_rank() if is_dist_avail_and_initialized() else 0
+    world_size = dist.get_world_size() if is_dist_avail_and_initialized() else 1
+    global_workers = num_workers * world_size
+    start = rank * num_workers
+    end = start + num_workers
+    local_samples = 0
+    for file_idx, file in enumerate(files):
+        mod = file_idx % global_workers
+        if start <= mod < end:
+            data = _safe_torch_load(file)
+            local_samples += len(data)
+    local_steps = local_samples // batch_size
+    if is_dist_avail_and_initialized():
+        t = torch.tensor(local_steps, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        return int(t.item())
+    return int(local_steps)
+
 def is_dist_avail_and_initialized():
     return dist.is_available() and dist.is_initialized()
 
@@ -123,6 +148,14 @@ def _gather_objects(obj):
     gathered = [None for _ in range(dist.get_world_size())]
     dist.all_gather_object(gathered, obj)
     return gathered
+
+def ddp_barrier():
+    if is_dist_avail_and_initialized():
+        dev = globals().get("device", None)
+        if dev is not None and hasattr(dev, "index") and dev.index is not None:
+            dist.barrier(device_ids=[dev.index])
+        else:
+            dist.barrier()
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -235,12 +268,12 @@ if __name__ == "__main__":
                 group_size=5
             )
         if use_ddp:
-            dist.barrier()
+            ddp_barrier()
     else:
         if is_main_process():
             logger.info(f"Train cache exists at {cache_dir}; skipping build.")
         if use_ddp:
-            dist.barrier()
+            ddp_barrier()
     dataset = CachedParaNMTMultiDataset(
         cache_dir,
         tokenized=True
@@ -251,8 +284,18 @@ if __name__ == "__main__":
         num_workers=4,
         pin_memory=True,
         collate_fn=default_data_collator,
-        persistent_workers=True
+        persistent_workers=True,
+        drop_last=True
     )
+
+    # Ensure all ranks run the same number of training steps
+    steps_per_epoch = int(os.environ.get("STEPS_PER_EPOCH", "0"))
+    if steps_per_epoch <= 0 and use_ddp:
+        steps_per_epoch = compute_min_steps_per_epoch(cache_dir, batch_size=32, num_workers=4)
+        if is_main_process():
+            logger.info(f"Using steps_per_epoch={steps_per_epoch} (min across ranks)")
+    elif steps_per_epoch > 0 and is_main_process():
+        logger.info(f"Using steps_per_epoch={steps_per_epoch} (from env)")
 
     #####################################
     #####################################
@@ -261,19 +304,19 @@ if __name__ == "__main__":
         if is_main_process():
             logger.info(f"Building val cache at {cache_dir}")
             build_paranmt_multi_cache(
-                input_path=train_datapath,
+                input_path=val_datapath,
                 output_dir=cache_dir,
                 tokenizer=tokenizer,
                 tokenize=True,   # or False for flexible experiments
                 group_size=5
             )
         if use_ddp:
-            dist.barrier()
+            ddp_barrier()
     else:
         if is_main_process():
             logger.info(f"Val cache exists at {cache_dir}; skipping build.")
         if use_ddp:
-            dist.barrier()
+            ddp_barrier()
     dataset = CachedParaNMTMultiDataset(
         cache_dir,
         tokenized=True
@@ -294,19 +337,19 @@ if __name__ == "__main__":
         if is_main_process():
             logger.info(f"Building test cache at {cache_dir}")
             build_paranmt_multi_cache(
-                input_path=train_datapath,
+                input_path=test_datapath,
                 output_dir=cache_dir,
                 tokenizer=tokenizer,
                 tokenize=True,   # or False for flexible experiments
                 group_size=5
             )
         if use_ddp:
-            dist.barrier()
+            ddp_barrier()
     else:
         if is_main_process():
             logger.info(f"Test cache exists at {cache_dir}; skipping build.")
         if use_ddp:
-            dist.barrier()
+            ddp_barrier()
     dataset = CachedParaNMTMultiDataset(
         cache_dir,
         tokenized=True
@@ -337,7 +380,72 @@ if __name__ == "__main__":
         num_steps = 0
         step = 0
 
-        for batch in train_loader:
+        if steps_per_epoch:
+            train_iter = iter(train_loader)
+            for _ in range(steps_per_epoch):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    batch = next(train_iter)
+                step += 1
+                if is_main_process() and step % 1000 == 0:
+                    log_mem(prefix=f"epoch {epoch} step {step}")
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"]
+                )
+
+                loss = outputs.loss
+
+                if "score" in batch:
+                    weights = batch["score"].to(device)
+                    loss = (loss * weights).mean()
+
+                if is_main_process() and step % 100 == 0:
+                    logger.info(f"epoch {epoch} step {step} loss: {loss.item():.4f}")
+
+                optimizer.zero_grad()
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                optimizer.step()
+
+                total_loss += loss.item()
+                num_steps += 1
+        else:
+            for batch in train_loader:
+                step += 1
+                if is_main_process() and step % 1000 == 0:
+                    log_mem(prefix=f"epoch {epoch} step {step}")
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"]
+                )
+
+                loss = outputs.loss
+
+                if "score" in batch:
+                    weights = batch["score"].to(device)
+                    loss = (loss * weights).mean()
+
+                if is_main_process() and step % 100 == 0:
+                    logger.info(f"epoch {epoch} step {step} loss: {loss.item():.4f}")
+
+                optimizer.zero_grad()
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                optimizer.step()
+
+                total_loss += loss.item()
+                num_steps += 1
             step += 1
             if is_main_process() and step % 1000 == 0:
                 log_mem(prefix=f"epoch {epoch} step {step}")
@@ -384,10 +492,10 @@ if __name__ == "__main__":
         # Validation
         # =========================
         if use_ddp:
-            dist.barrier()
+            ddp_barrier()
         val_metrics = evaluate(model, val_loader, tokenizer, eval_mode=eval_mode)
         if use_ddp:
-            dist.barrier()
+            ddp_barrier()
 
         if is_main_process() and val_metrics is not None:
             print(f"\nEpoch {epoch}")
@@ -418,7 +526,7 @@ if __name__ == "__main__":
         if is_main_process():
             state = torch.load("best_model.pt")
             model.module.load_state_dict(state)
-        dist.barrier()
+        ddp_barrier()
         if not is_main_process():
             state = torch.load("best_model.pt")
             model.module.load_state_dict(state)
@@ -426,10 +534,10 @@ if __name__ == "__main__":
         model.load_state_dict(torch.load("best_model.pt"))
 
     if use_ddp:
-        dist.barrier()
+        ddp_barrier()
     test_metrics = evaluate(model, test_loader, tokenizer, eval_mode=eval_mode)
     if use_ddp:
-        dist.barrier()
+        ddp_barrier()
 
     if is_main_process() and test_metrics is not None:
         print("\nTest Results:")
