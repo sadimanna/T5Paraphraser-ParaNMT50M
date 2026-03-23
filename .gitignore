@@ -1,1 +1,32 @@
 dataset
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Logs
+logs/
+*.log
+*.err
+*.out
+slurm_logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

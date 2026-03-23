@@ -1,14 +1,37 @@
 import os
 import torch
+import torch.distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
 from typing import Optional, List
 import glob
 from collections import defaultdict
 import random
+import gc
 # from sentence_transformers import SentenceTransformer, util
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
+from transformers.tokenization_utils_base import BatchEncoding
+import tokenizers
 import torch.nn.functional as F
+
+
+# =========================
+# Safe torch.load for cached data
+# =========================
+def _safe_torch_load(path):
+    if hasattr(torch.serialization, "safe_globals"):
+        with torch.serialization.safe_globals([BatchEncoding, tokenizers.Encoding]):
+            return torch.load(path, weights_only=True)
+    # Fallback for older torch versions
+    return torch.load(path)
+
+
+# DDP helpers
+def _get_dist_info():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
 # =========================
 # Utility: Parsing
 # =========================
@@ -92,13 +115,14 @@ def build_paranmt_multi_cache(
     tokenizer=None,
     tokenize=True,
     model_name="all-MiniLM-L6-v2",
-    chunk_size=5000,
+    chunk_size=1000,
     group_size=3,
     min_len=5,
     max_len=50,
     min_sim=0.5,
     max_sim=0.95,
-    max_length=128
+    max_length=128,
+    cache_clear_every=5
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -110,6 +134,13 @@ def build_paranmt_multi_cache(
 
     buffer = []
     shard_id = 0
+    encode_call_count = 0
+
+    def _maybe_clear_cache(call_count):
+        if cache_clear_every and call_count % cache_clear_every == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
     def mean_pooling(model_output, attention_mask):
         token_embeddings = model_output.last_hidden_state
@@ -132,6 +163,13 @@ def build_paranmt_multi_cache(
 
         embeddings = mean_pooling(outputs, inputs["attention_mask"])
         embeddings = F.normalize(embeddings, p=2, dim=1)  # important
+        # Move embeddings to CPU to avoid holding GPU memory across batches
+        embeddings = embeddings.cpu()
+        # Clear GPU tensors/cache proactively (throttled)
+        del inputs, outputs
+        nonlocal encode_call_count
+        encode_call_count += 1
+        _maybe_clear_cache(encode_call_count)
 
         return embeddings
     
@@ -163,6 +201,8 @@ def build_paranmt_multi_cache(
 
         # Step 2: SBERT embeddings (batch)
         all_sentences = list(groups.keys())
+        if not all_sentences:
+            return shard_id
         embeddings = encode(all_sentences)
 
         emb_map = {s: embeddings[i] for i, s in enumerate(all_sentences)}
@@ -219,7 +259,11 @@ def build_paranmt_multi_cache(
 
         # save shard
         torch.save(results, os.path.join(output_dir, f"shard_{shard_id}.pt"))
-        return shard_id + 1
+        # Clear large tensors and cache between shards (throttled)
+        del embeddings, emb_map, groups, results, all_sentences
+        next_shard_id = shard_id + 1
+        _maybe_clear_cache(next_shard_id)
+        return next_shard_id
 
     # =========================
     # Main loop
@@ -503,13 +547,16 @@ class CachedIterableDataset(IterableDataset):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1
+        rank, world_size = _get_dist_info()
+        global_workers = num_workers * world_size
+        global_worker_id = worker_id + num_workers * rank
 
         # shard at file level (efficient)
         for file_idx, file in enumerate(self.files):
-            if file_idx % num_workers != worker_id:
+            if file_idx % global_workers != global_worker_id:
                 continue
 
-            data = torch.load(file)
+            data = _safe_torch_load(file)
 
             for item in data:
                 if self.tokenized:
@@ -556,13 +603,16 @@ class CachedParaNMTMultiDataset(IterableDataset):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1
+        rank, world_size = _get_dist_info()
+        global_workers = num_workers * world_size
+        global_worker_id = worker_id + num_workers * rank
 
         # file-level sharding (efficient)
         for file_idx, file in enumerate(self.files):
-            if file_idx % num_workers != worker_id:
+            if file_idx % global_workers != global_worker_id:
                 continue
 
-            data = torch.load(file)
+            data = _safe_torch_load(file)
 
             for item in data:
                 if self.tokenized:

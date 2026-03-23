@@ -1,37 +1,63 @@
-import torch
 import logging
+import psutil
+import torch
+import argparse
+import os, sys
+import glob
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM
-from transformers import T5Tokenizer, T5ForConditionalGeneration, DataCollatorForLanguageModeling
+from transformers import T5Tokenizer, T5ForConditionalGeneration, DataCollatorForSeq2Seq, DefaultDataCollator, default_data_collator
 from transformers import TrainingArguments, Trainer
 from datasets import load_dataset
-from data_classes import ParaNMTIterableDataset, CachedIterableDataset, build_cache, build_paranmt_multi_cache, CachedParaNMTMultiDataset
-import argparse
-import os
-import glob
-from torch.utils.data import DataLoader
+from torch.utils.data import random_split, DataLoader
 from peft import LoraConfig, get_peft_model, TaskType
+from bert_score import score, BERTScorer
+from sacrebleu import corpus_bleu
+from data_classes import ParaNMTIterableDataset, CachedIterableDataset, build_cache, build_paranmt_multi_cache, CachedParaNMTMultiDataset
 
-from bert_score import score
 
 def compute_bertscore(preds, refs):
-    P, R, F1 = score(preds, refs, lang="en", verbose=False)
+    # scorer = _get_bertscorer()
+    # P, R, F1 = scorer.score(preds, refs)
+    P, R, F1 = score(preds, refs)
     return F1.mean().item()
-
-from sacrebleu import corpus_bleu
 
 def compute_bleu(preds, refs):
     return corpus_bleu(preds, [refs]).score
 
+_BERT_SCORER = None
+
+def _get_device():
+    dev = globals().get("device", None)
+    if dev is None:
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return dev
+
+def _get_bertscorer():
+    global _BERT_SCORER
+    if _BERT_SCORER is None:
+        _BERT_SCORER = BERTScorer(lang="en", rescale_with_baseline=True, device=_get_device())
+        tok = _BERT_SCORER._tokenizer
+        if not hasattr(tok, "build_inputs_with_special_tokens"):
+            def build_inputs_with_special_tokens(token_ids_0, token_ids_1=None):
+                if token_ids_1 is None:
+                    return [tok.cls_token_id] + token_ids_0 + [tok.sep_token_id]
+                return [tok.cls_token_id] + token_ids_0 + [tok.sep_token_id, tok.sep_token_id] + token_ids_1 + [tok.sep_token_id]
+            tok.build_inputs_with_special_tokens = build_inputs_with_special_tokens
+    return _BERT_SCORER
+
 def generate_predictions(model, loader, tokenizer, max_length=128):
     model.eval()
+    model_for_gen = model.module if hasattr(model, "module") else model
     preds, refs = [], []
 
     with torch.no_grad():
         for batch in loader:
-            batch = {k: v.cuda() for k, v in batch.items()}
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-            generated_ids = model.generate(
+            generated_ids = model_for_gen.generate(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 max_length=max_length,
@@ -46,12 +72,22 @@ def generate_predictions(model, loader, tokenizer, max_length=128):
 
     return preds, refs
 
-def evaluate(model, loader, tokenizer):
+def evaluate(model, loader, tokenizer, eval_mode="gather_preds"):
     preds, refs = generate_predictions(model, loader, tokenizer)
+
+    # Gather preds/refs across ranks (if DDP)
+    if is_dist_avail_and_initialized():
+        gathered_preds = _gather_objects(preds)
+        gathered_refs = _gather_objects(refs)
+        # Flatten
+        preds = [p for sub in gathered_preds for p in sub]
+        refs = [r for sub in gathered_refs for r in sub]
+
+    if not is_main_process():
+        return None
 
     bert = compute_bertscore(preds, refs)
     bleu = compute_bleu(preds, refs)
-    # diversity = distinct_n(preds)
 
     return {
         "bertscore": bert,
@@ -61,12 +97,51 @@ def evaluate(model, loader, tokenizer):
 
 logger = logging.getLogger(__name__)
 
+def log_gpu_mem(prefix=""):
+    if torch.cuda.is_available():
+        alloc_gb = torch.cuda.memory_allocated() / (1024**3)
+        reserv_gb = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(f"{prefix} GPU mem: allocated={alloc_gb:.2f} GB, reserved={reserv_gb:.2f} GB")
+
+def log_cpu_mem(prefix=""):
+    rss_gb = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+    logger.info(f"{prefix} CPU RSS: {rss_gb:.2f} GB")
+
+def log_mem(prefix=""):
+    log_cpu_mem(prefix)
+    log_gpu_mem(prefix)
+
+def is_dist_avail_and_initialized():
+    return dist.is_available() and dist.is_initialized()
+
+def is_main_process():
+    return (not is_dist_avail_and_initialized()) or dist.get_rank() == 0
+
+def _gather_objects(obj):
+    if not is_dist_avail_and_initialized():
+        return [obj]
+    gathered = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, obj)
+    return gathered
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s"
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
     )
     logger.info("Starting paraphraser training script")
+    eval_mode = os.environ.get("EVAL_MODE", "gather_preds")
+    # DDP init (torchrun will set WORLD_SIZE/LOCAL_RANK)
+    use_ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if use_ddp:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     r = 2
     target_modules = ['q']
     model_name = "google-t5/t5-small"
@@ -80,8 +155,9 @@ if __name__ == "__main__":
     # Model Declaration
     logger.info("Loading model: %s", model_name)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name) #"google/flan-t5-base")
-    model.to("cuda")
+    model.to(device)
     model.eval()
+    model_for_gen = model.module if hasattr(model, "module") else model
     # print(model)
     # print("Before Applying LoRA")
     # # Total parameters and trainable parameters.
@@ -104,14 +180,19 @@ if __name__ == "__main__":
     )
     # Get PEFT-ed Model
     model = get_peft_model(model, config)
+    if use_ddp:
+        model = DDP(model, device_ids=[device.index], output_device=device.index)
     # print(model)
-    logger.info("After applying LoRA")
+    if is_main_process():
+        logger.info("After applying LoRA")
     # Total parameters and trainable parameters.
     total_params = sum(p.numel() for p in model.parameters())
-    logger.info("%s total parameters.", f"{total_params:,}")
+    if is_main_process():
+        logger.info("%s total parameters.", f"{total_params:,}")
     total_trainable_params = sum(
         p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("%s training parameters.", f"{total_trainable_params:,}")
+    if is_main_process():
+        logger.info("%s training parameters.", f"{total_trainable_params:,}")
 
     #####################################
     # LOAD DATASET
@@ -141,16 +222,27 @@ if __name__ == "__main__":
     #     "dataset/cache_paranmt",
     #     tokenized=True
     # )
-    logger.info("Building train cache")
-    build_paranmt_multi_cache(
-        input_path=train_datapath,
-        output_dir="dataset/train_cache_multi",
-        tokenizer=tokenizer,
-        tokenize=True,   # or False for flexible experiments
-        group_size=5
-    )
+    #####################################
+    cache_dir = "./dataset/train_cache_multi"
+    if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
+        if is_main_process():
+            logger.info(f"Building train cache at {cache_dir}")
+            build_paranmt_multi_cache(
+                input_path=train_datapath,
+                output_dir=cache_dir,
+                tokenizer=tokenizer,
+                tokenize=True,   # or False for flexible experiments
+                group_size=5
+            )
+        if use_ddp:
+            dist.barrier()
+    else:
+        if is_main_process():
+            logger.info(f"Train cache exists at {cache_dir}; skipping build.")
+        if use_ddp:
+            dist.barrier()
     dataset = CachedParaNMTMultiDataset(
-        "dataset/train_cache_multi",
+        cache_dir,
         tokenized=True
     )
     train_loader = torch.utils.data.DataLoader(
@@ -158,19 +250,32 @@ if __name__ == "__main__":
         batch_size=32,
         num_workers=4,
         pin_memory=True,
+        collate_fn=default_data_collator,
         persistent_workers=True
     )
+
     #####################################
-    logger.info("Building val cache")
-    build_paranmt_multi_cache(
-        input_path=train_datapath,
-        output_dir="dataset/val_cache_multi",
-        tokenizer=tokenizer,
-        tokenize=True,   # or False for flexible experiments
-        group_size=5
-    )
+    #####################################
+    cache_dir = "./dataset/val_cache_multi"
+    if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
+        if is_main_process():
+            logger.info(f"Building val cache at {cache_dir}")
+            build_paranmt_multi_cache(
+                input_path=train_datapath,
+                output_dir=cache_dir,
+                tokenizer=tokenizer,
+                tokenize=True,   # or False for flexible experiments
+                group_size=5
+            )
+        if use_ddp:
+            dist.barrier()
+    else:
+        if is_main_process():
+            logger.info(f"Val cache exists at {cache_dir}; skipping build.")
+        if use_ddp:
+            dist.barrier()
     dataset = CachedParaNMTMultiDataset(
-        "dataset/val_cache_multi",
+        cache_dir,
         tokenized=True
     )
     val_loader = torch.utils.data.DataLoader(
@@ -178,19 +283,32 @@ if __name__ == "__main__":
         batch_size=32,
         num_workers=4,
         pin_memory=True,
+        collate_fn=default_data_collator,
         persistent_workers=True
     )
+
     #####################################
-    logger.info("Building test cache")
-    build_paranmt_multi_cache(
-        input_path=train_datapath,
-        output_dir="dataset/test_cache_multi",
-        tokenizer=tokenizer,
-        tokenize=True,   # or False for flexible experiments
-        group_size=5
-    )
+    #####################################
+    cache_dir = "./dataset/test_cache_multi"
+    if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
+        if is_main_process():
+            logger.info(f"Building test cache at {cache_dir}")
+            build_paranmt_multi_cache(
+                input_path=train_datapath,
+                output_dir=cache_dir,
+                tokenizer=tokenizer,
+                tokenize=True,   # or False for flexible experiments
+                group_size=5
+            )
+        if use_ddp:
+            dist.barrier()
+    else:
+        if is_main_process():
+            logger.info(f"Test cache exists at {cache_dir}; skipping build.")
+        if use_ddp:
+            dist.barrier()
     dataset = CachedParaNMTMultiDataset(
-        "dataset/test_cache_multi",
+        cache_dir,
         tokenized=True
     )
     test_loader = torch.utils.data.DataLoader(
@@ -198,8 +316,10 @@ if __name__ == "__main__":
         batch_size=32,
         num_workers=4,
         pin_memory=True,
+        collate_fn=default_data_collator,
         persistent_workers=True
     )
+
     #####################################
     # TRAINING LOOP
     #####################################
@@ -210,14 +330,19 @@ if __name__ == "__main__":
     model.train()
 
     best_val_score = 0.0
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     for epoch in range(num_epochs):
         model.train()
-        total_loss = 0
+        total_loss = 0.0
+        num_steps = 0
+        step = 0
 
         for batch in train_loader:
+            step += 1
+            if is_main_process() and step % 1000 == 0:
+                log_mem(prefix=f"epoch {epoch} step {step}")
             batch = {k: v.to(device) for k, v in batch.items()}
+            # logger.info(batch["input_ids"])
 
             outputs = model(
                 input_ids=batch["input_ids"],
@@ -232,6 +357,9 @@ if __name__ == "__main__":
                 weights = batch["score"].to(device)
                 loss = (loss * weights).mean()
 
+            if is_main_process() and step % 100 == 0:
+                logger.info(f"epoch {epoch} step {step} loss: {loss.item():.4f}")
+
             optimizer.zero_grad()
             loss.backward()
 
@@ -240,36 +368,72 @@ if __name__ == "__main__":
             optimizer.step()
 
             total_loss += loss.item()
+            num_steps += 1
 
-        avg_train_loss = total_loss / len(train_loader)
+        avg_train_loss = total_loss / max(1, num_steps)
+
+        # Epoch memory summary
+        if is_main_process():
+            log_mem(prefix=f"epoch {epoch} summary")
+            if torch.cuda.is_available():
+                peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
+                logger.info(f"epoch {epoch} peak GPU allocated: {peak_gb:.2f} GB")
+                torch.cuda.reset_peak_memory_stats()
 
         # =========================
         # Validation
         # =========================
-        val_metrics = evaluate(model, val_loader, tokenizer)
+        if use_ddp:
+            dist.barrier()
+        val_metrics = evaluate(model, val_loader, tokenizer, eval_mode=eval_mode)
+        if use_ddp:
+            dist.barrier()
 
-        print(f"\nEpoch {epoch}")
-        print(f"Train Loss: {avg_train_loss:.4f}")
-        print(f"Val BERTScore: {val_metrics['bertscore']:.4f}")
-        print(f"Val BLEU: {val_metrics['bleu']:.2f}")
-        print(f"Val Diversity: {val_metrics['diversity']:.4f}")
+        if is_main_process() and val_metrics is not None:
+            print(f"\nEpoch {epoch}")
+            print(f"Train Loss: {avg_train_loss:.4f}")
+            print(f"Val BERTScore: {val_metrics['bertscore']:.4f}")
+            print(f"Val BLEU: {val_metrics['bleu']:.2f}")
+            # print(f"Val Diversity: {val_metrics['diversity']:.4f}")
 
-        # =========================
-        # Model selection
-        # =========================
-        if val_metrics["bertscore"] > best_val_score:
-            best_val_score = val_metrics["bertscore"]
-            torch.save(model.state_dict(), "best_model.pt")
-            print("Saved best model!")
+            # =========================
+            # Model selection
+            # =========================
+            if val_metrics["bertscore"] > best_val_score:
+                best_val_score = val_metrics["bertscore"]
+                if use_ddp:
+                    torch.save(model.module.state_dict(), "best_model.pt")
+                else:
+                    torch.save(model.state_dict(), "best_model.pt")
+                print("Saved best model!")
 
     ######################################
     # EVALUATION
     ######################################
     model.eval()
+    model_for_gen = model.module if hasattr(model, "module") else model
 
-    model.load_state_dict(torch.load("best_model.pt"))
+    # Load best checkpoint on all ranks if using DDP
+    if use_ddp:
+        if is_main_process():
+            state = torch.load("best_model.pt")
+            model.module.load_state_dict(state)
+        dist.barrier()
+        if not is_main_process():
+            state = torch.load("best_model.pt")
+            model.module.load_state_dict(state)
+    else:
+        model.load_state_dict(torch.load("best_model.pt"))
 
-    test_metrics = evaluate(model, test_loader, tokenizer)
+    if use_ddp:
+        dist.barrier()
+    test_metrics = evaluate(model, test_loader, tokenizer, eval_mode=eval_mode)
+    if use_ddp:
+        dist.barrier()
 
-    print("\nTest Results:")
-    print(test_metrics)
+    if is_main_process() and test_metrics is not None:
+        print("\nTest Results:")
+        print(test_metrics)
+
+    if use_ddp:
+        dist.destroy_process_group()
