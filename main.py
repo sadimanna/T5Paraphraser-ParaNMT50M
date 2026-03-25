@@ -15,7 +15,7 @@ from torch.utils.data import random_split, DataLoader
 from peft import LoraConfig, get_peft_model, TaskType
 from bert_score import score, BERTScorer
 from sacrebleu import corpus_bleu
-from data_classes import ParaNMTIterableDataset, CachedIterableDataset, build_cache, build_paranmt_multi_cache, CachedParaNMTMultiDataset, _safe_torch_load
+from data_classes import ParaNMTIterableDataset, build_paranmt_multi_cache, CachedParaNMTMultiDataset, _safe_torch_load
 
 
 def compute_bertscore(preds, refs):
@@ -74,30 +74,78 @@ def generate_predictions(model, loader, tokenizer, max_length=128):
 def evaluate(model, loader, tokenizer, eval_mode="gather_preds"):
     preds, refs = generate_predictions(model, loader, tokenizer)
 
-    # Gather preds/refs across ranks (if DDP)
-    if is_dist_avail_and_initialized():
-        gathered_preds = _gather_objects(preds)
-        gathered_refs = _gather_objects(refs)
-        # Flatten
-        preds = [p for sub in gathered_preds for p in sub]
-        refs = [r for sub in gathered_refs for r in sub]
+    if eval_mode == "gather_preds":
+        # Gather preds/refs across ranks (if DDP)
+        if is_dist_avail_and_initialized():
+            gathered_preds = _gather_objects(preds)
+            gathered_refs = _gather_objects(refs)
+            preds = [p for sub in gathered_preds for p in sub]
+            refs = [r for sub in gathered_refs for r in sub]
 
+        if not is_main_process():
+            return None
+
+        # Drop empty candidates/refs to avoid BERTScore warnings
+        pairs = [(p, r) for p, r in zip(preds, refs) if p and p.strip() and r and r.strip()]
+        dropped = len(preds) - len(pairs)
+        if dropped > 0:
+            logger.warning(f"Dropped {dropped} empty pred/ref pairs before BERTScore")
+        if not pairs:
+            return {"bertscore": 0.0, "bleu": 0.0}
+        preds, refs = zip(*pairs)
+        preds, refs = list(preds), list(refs)
+
+        try:
+            bert = compute_bertscore(preds, refs)
+        except Exception:
+            logger.exception("BERTScore failed; setting to 0.0")
+            bert = 0.0
+        bleu = compute_bleu(preds, refs)
+
+        return {"bertscore": bert, "bleu": bleu}
+
+    if eval_mode == "gather_metrics":
+        # Drop empty candidates/refs locally to avoid BERTScore warnings
+        local_pairs = [(p, r) for p, r in zip(preds, refs) if p and p.strip() and r and r.strip()]
+        if local_pairs:
+            preds, refs = zip(*local_pairs)
+            preds, refs = list(preds), list(refs)
+        else:
+            preds, refs = [], []
+
+        try:
+            local_bert = compute_bertscore(preds, refs) if preds else 0.0
+        except Exception:
+            if is_main_process():
+                logger.exception("BERTScore failed; setting to 0.0")
+            local_bert = 0.0
+        local_bleu = compute_bleu(preds, refs) if preds else 0.0
+        local_count = len(preds)
+
+        if is_dist_avail_and_initialized():
+            gathered = _gather_objects({"bertscore": local_bert, "bleu": local_bleu, "count": local_count})
+            if not is_main_process():
+                return None
+            total_count = sum(g["count"] for g in gathered)
+            if total_count == 0:
+                return {"bertscore": 0.0, "bleu": 0.0}
+            bert = sum(g["bertscore"] * g["count"] for g in gathered) / total_count
+            bleu = sum(g["bleu"] * g["count"] for g in gathered) / total_count
+            return {"bertscore": bert, "bleu": bleu}
+        else:
+            return {"bertscore": local_bert, "bleu": local_bleu}
+
+    # Fallback: local on main
     if not is_main_process():
         return None
-
     try:
         bert = compute_bertscore(preds, refs)
-    except Exception as e:
-        if is_main_process():
-            logger.exception("BERTScore failed; setting to 0.0", exc_info=e)
+    except Exception:
+        logger.exception("BERTScore failed; setting to 0.0")
         bert = 0.0
     bleu = compute_bleu(preds, refs)
+    return {"bertscore": bert, "bleu": bleu}
 
-    return {
-        "bertscore": bert,
-        "bleu": bleu,
-        # "diversity": diversity
-    }
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +212,25 @@ if __name__ == "__main__":
         handlers=[logging.StreamHandler(sys.stdout)],
     )
     logger.info("Starting paraphraser training script")
+    parser = argparse.ArgumentParser(description="Paraphraser training")
+    parser.add_argument(
+        "--full_finetune",
+        action="store_true",
+        help="Enable full fine-tuning (no LoRA adapters).",
+    )
+    parser.add_argument(
+        "--lora_r",
+        type=int,
+        default=8,
+        help="LoRA rank (used only if not full fine-tuning).",
+    )
+    parser.add_argument(
+        "--target_modules",
+        nargs="+",
+        default=["q", "k", "v"],
+        help="Target modules for LoRA (used only if not full fine-tuning).",
+    )
+    args = parser.parse_args()
     eval_mode = os.environ.get("EVAL_MODE", "gather_preds")
     # DDP init (torchrun will set WORLD_SIZE/LOCAL_RANK)
     use_ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -175,8 +242,8 @@ if __name__ == "__main__":
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    r = 2
-    target_modules = ['q']
+    r = args.lora_r
+    target_modules = args.target_modules
     model_name = "google-t5/t5-small"
     train_datapath = "./dataset/para-nmt-5m-processed/train.txt"
     val_datapath = "./dataset/para-nmt-5m-processed/val.txt"
@@ -202,84 +269,75 @@ if __name__ == "__main__":
     # Declaring Tokenizer
     logger.info("Loading tokenizer: %s", model_name)
     tokenizer = T5Tokenizer.from_pretrained(model_name) #"google/flan-t5-base")
-    # Declaring LoRA Config
-    config = LoraConfig(
-        r=r,
-        lora_alpha=r * 2,
-        target_modules=target_modules,
-        lora_dropout=0.0,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    # Get PEFT-ed Model
-    model = get_peft_model(model, config)
+    if args.full_finetune:
+        if is_main_process():
+            logger.info("Full fine-tuning enabled (LoRA disabled).")
+    else:
+        # Declaring LoRA Config
+        config = LoraConfig(
+            r=r,
+            lora_alpha=r * 2,
+            target_modules=target_modules,
+            lora_dropout=0.0,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        # Get PEFT-ed Model
+        model = get_peft_model(model, config)
     if use_ddp:
         model = DDP(model, device_ids=[device.index], output_device=device.index)
     # print(model)
-    if is_main_process():
-        logger.info("After applying LoRA")
     # Total parameters and trainable parameters.
     total_params = sum(p.numel() for p in model.parameters())
+    total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if is_main_process():
+        if not args.full_finetune:
+            logger.info("After applying LoRA")
+            logger.info(f"Percentage of trainable params: {100 * total_trainable_params / total_params:.2f}%")
+        else:
+            logger.info("Full finetuning")
         logger.info("%s total parameters.", f"{total_params:,}")
-    total_trainable_params = sum(
-        p.numel() for p in model.parameters() if p.requires_grad)
-    if is_main_process():
         logger.info("%s training parameters.", f"{total_trainable_params:,}")
 
     #####################################
-    # LOAD DATASET
+    # LOAD DATASET (Streaming)
     #####################################
-    # dataset = ParaNMTIterableDataset(
-    #     datapath,
-    #     tokenizer=tokenizer,
-    #     tokenize_on_the_fly=True
-    # )
+    dataset_mode = os.environ.get("DATASET_MODE", "stream").strip().lower()
+    if dataset_mode not in {"stream", "cache"}:
+        raise ValueError(f"Unsupported DATASET_MODE={dataset_mode!r}. Use 'stream' or 'cache'.")
 
-    # loader = torch.utils.data.DataLoader(
-    #     dataset,
-    #     batch_size=32,
-    #     num_workers=4,
-    #     pin_memory=True
-    # )
-    #####################################
-    # BUILD CACHE
-    #####################################
-    # build_cache(
-    #     input_path=datapath,
-    #     output_dir="dataset/cache_paranmt",
-    #     tokenizer=tokenizer,
-    #     tokenize=True   # 🔥 switch off if you want raw cache
-    # )
-    # dataset = CachedIterableDataset(
-    #     "dataset/cache_paranmt",
-    #     tokenized=True
-    # )
-    #####################################
-    cache_dir = "./dataset/train_cache_multi"
-    if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
-        if is_main_process():
-            logger.info(f"Building train cache at {cache_dir}")
-            build_paranmt_multi_cache(
-                input_path=train_datapath,
-                output_dir=cache_dir,
-                tokenizer=tokenizer,
-                tokenize=True,   # or False for flexible experiments
-                group_size=5
-            )
-        if use_ddp:
-            ddp_barrier()
+    if dataset_mode == "cache":
+        cache_dir = "./dataset/train_cache_multi"
+        if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
+            if is_main_process():
+                logger.info(f"Building train cache at {cache_dir}")
+                build_paranmt_multi_cache(
+                    input_path=train_datapath,
+                    output_dir=cache_dir,
+                    tokenizer=tokenizer,
+                    tokenize=True,   # or False for flexible experiments
+                    group_size=5
+                )
+            if use_ddp:
+                ddp_barrier()
+        else:
+            if is_main_process():
+                logger.info(f"Train cache exists at {cache_dir}; skipping build.")
+            if use_ddp:
+                ddp_barrier()
+        train_dataset = CachedParaNMTMultiDataset(
+            cache_dir,
+            tokenized=True
+        )
     else:
-        if is_main_process():
-            logger.info(f"Train cache exists at {cache_dir}; skipping build.")
-        if use_ddp:
-            ddp_barrier()
-    dataset = CachedParaNMTMultiDataset(
-        cache_dir,
-        tokenized=True
-    )
+        train_dataset = ParaNMTIterableDataset(
+            train_datapath,
+            tokenizer=tokenizer,
+            tokenize_on_the_fly=True
+        )
+
     train_loader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         batch_size=32,
         num_workers=4,
         pin_memory=True,
@@ -290,39 +348,48 @@ if __name__ == "__main__":
 
     # Ensure all ranks run the same number of training steps
     steps_per_epoch = int(os.environ.get("STEPS_PER_EPOCH", "0"))
-    if steps_per_epoch <= 0 and use_ddp:
+    if steps_per_epoch > 0 and is_main_process():
+        logger.info(f"Using steps_per_epoch={steps_per_epoch} (from env)")
+    elif steps_per_epoch <= 0 and use_ddp and dataset_mode == "cache":
         steps_per_epoch = compute_min_steps_per_epoch(cache_dir, batch_size=32, num_workers=4)
         if is_main_process():
             logger.info(f"Using steps_per_epoch={steps_per_epoch} (min across ranks)")
-    elif steps_per_epoch > 0 and is_main_process():
-        logger.info(f"Using steps_per_epoch={steps_per_epoch} (from env)")
+    elif steps_per_epoch <= 0 and use_ddp and is_main_process():
+        logger.warning("DDP is enabled but STEPS_PER_EPOCH is not set; ranks may desync on iterable data.")
 
     #####################################
     #####################################
-    cache_dir = "./dataset/val_cache_multi"
-    if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
-        if is_main_process():
-            logger.info(f"Building val cache at {cache_dir}")
-            build_paranmt_multi_cache(
-                input_path=val_datapath,
-                output_dir=cache_dir,
-                tokenizer=tokenizer,
-                tokenize=True,   # or False for flexible experiments
-                group_size=5
-            )
-        if use_ddp:
-            ddp_barrier()
+    if dataset_mode == "cache":
+        cache_dir = "./dataset/val_cache_multi"
+        if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
+            if is_main_process():
+                logger.info(f"Building val cache at {cache_dir}")
+                build_paranmt_multi_cache(
+                    input_path=val_datapath,
+                    output_dir=cache_dir,
+                    tokenizer=tokenizer,
+                    tokenize=True,   # or False for flexible experiments
+                    group_size=5
+                )
+            if use_ddp:
+                ddp_barrier()
+        else:
+            if is_main_process():
+                logger.info(f"Val cache exists at {cache_dir}; skipping build.")
+            if use_ddp:
+                ddp_barrier()
+        val_dataset = CachedParaNMTMultiDataset(
+            cache_dir,
+            tokenized=True
+        )
     else:
-        if is_main_process():
-            logger.info(f"Val cache exists at {cache_dir}; skipping build.")
-        if use_ddp:
-            ddp_barrier()
-    dataset = CachedParaNMTMultiDataset(
-        cache_dir,
-        tokenized=True
-    )
+        val_dataset = ParaNMTIterableDataset(
+            val_datapath,
+            tokenizer=tokenizer,
+            tokenize_on_the_fly=True
+        )
     val_loader = torch.utils.data.DataLoader(
-        dataset,
+        val_dataset,
         batch_size=32,
         num_workers=4,
         pin_memory=True,
@@ -332,30 +399,37 @@ if __name__ == "__main__":
 
     #####################################
     #####################################
-    cache_dir = "./dataset/test_cache_multi"
-    if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
-        if is_main_process():
-            logger.info(f"Building test cache at {cache_dir}")
-            build_paranmt_multi_cache(
-                input_path=test_datapath,
-                output_dir=cache_dir,
-                tokenizer=tokenizer,
-                tokenize=True,   # or False for flexible experiments
-                group_size=5
-            )
-        if use_ddp:
-            ddp_barrier()
+    if dataset_mode == "cache":
+        cache_dir = "./dataset/test_cache_multi"
+        if not (os.path.isdir(cache_dir) and os.listdir(cache_dir)):
+            if is_main_process():
+                logger.info(f"Building test cache at {cache_dir}")
+                build_paranmt_multi_cache(
+                    input_path=test_datapath,
+                    output_dir=cache_dir,
+                    tokenizer=tokenizer,
+                    tokenize=True,   # or False for flexible experiments
+                    group_size=5
+                )
+            if use_ddp:
+                ddp_barrier()
+        else:
+            if is_main_process():
+                logger.info(f"Test cache exists at {cache_dir}; skipping build.")
+            if use_ddp:
+                ddp_barrier()
+        test_dataset = CachedParaNMTMultiDataset(
+            cache_dir,
+            tokenized=True
+        )
     else:
-        if is_main_process():
-            logger.info(f"Test cache exists at {cache_dir}; skipping build.")
-        if use_ddp:
-            ddp_barrier()
-    dataset = CachedParaNMTMultiDataset(
-        cache_dir,
-        tokenized=True
-    )
+        test_dataset = ParaNMTIterableDataset(
+            test_datapath,
+            tokenizer=tokenizer,
+            tokenize_on_the_fly=True
+        )
     test_loader = torch.utils.data.DataLoader(
-        dataset,
+        test_dataset,
         batch_size=32,
         num_workers=4,
         pin_memory=True,
@@ -509,10 +583,12 @@ if __name__ == "__main__":
             # =========================
             if val_metrics["bertscore"] > best_val_score:
                 best_val_score = val_metrics["bertscore"]
+                if not os.path.exists("./saved_models"):
+                    os.makedirs("./saved_models")
                 if use_ddp:
-                    torch.save(model.module.state_dict(), "best_model.pt")
+                    torch.save(model.module.state_dict(), "saved_models/best_model.pt")
                 else:
-                    torch.save(model.state_dict(), "best_model.pt")
+                    torch.save(model.state_dict(), "saved_models/best_model.pt")
                 print("Saved best model!")
 
     ######################################

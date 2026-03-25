@@ -468,6 +468,7 @@ class ParaNMTIterableDataset(IterableDataset):
             truncation=True,
             padding="max_length",
             max_length=self.max_length,
+            add_special_tokens=True,
             return_tensors="pt",
         )
 
@@ -476,11 +477,17 @@ class ParaNMTIterableDataset(IterableDataset):
             truncation=True,
             padding="max_length",
             max_length=self.max_length,
+            add_special_tokens=True,
             return_tensors="pt",
         )
 
         inputs = {k: v.squeeze(0) for k, v in inputs.items()}
-        inputs["labels"] = labels["input_ids"].squeeze(0)
+        label_ids = labels["input_ids"].squeeze(0)
+        # Mask padding in labels so loss ignores pad tokens.
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is not None:
+            label_ids = label_ids.masked_fill(label_ids == pad_id, -100)
+        inputs["labels"] = label_ids
         return inputs
 
     def __iter__(self):

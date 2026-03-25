@@ -1,4 +1,6 @@
 dataset
+saved_models
+*.pt
 
 # Python
 __pycache__/

@@ -63,16 +63,4 @@ export MASTER_PORT=12345
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_FR_BUFFER_SIZE=1
 
-export DATASET_MODE="stream"
-export EVAL_MODE="gather_preds"
-
-torchrun \
-    --nnodes=$NUM_NODES \
-    --node_rank=$NODE_RANK \
-    --nproc_per_node=$NUM_GPUS \
-    --rdzv_id=$SLURM_JOB_ID \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-    main.py --lora_r 8 --target_modules 'q' 'k' 'v'
-
-# srun python main.py
+srun python test_cached_dataset.py
