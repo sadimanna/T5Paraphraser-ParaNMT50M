@@ -65,6 +65,7 @@ export TORCH_FR_BUFFER_SIZE=1
 
 export DATASET_MODE="stream"
 export EVAL_MODE="gather_preds"
+export STEPS_PER_EPOCH=-1
 
 torchrun \
     --nnodes=$NUM_NODES \
@@ -73,6 +74,6 @@ torchrun \
     --rdzv_id=$SLURM_JOB_ID \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-    main.py --lora_r 8 --target_modules 'q' 'k' 'v'
+    main.py --lora_r 16 --target_modules 'q' 'k' 'v'
 
 # srun python main.py

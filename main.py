@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM
-from transformers import T5Tokenizer, T5ForConditionalGeneration, DataCollatorForSeq2Seq, DefaultDataCollator, default_data_collator
-from transformers import TrainingArguments, Trainer
+from transformers import T5Tokenizer, T5ForConditionalGeneration, default_data_collator
+# from transformers import TrainingArguments, Trainer
 from datasets import load_dataset
 from torch.utils.data import random_split, DataLoader
 from peft import LoraConfig, get_peft_model, TaskType
@@ -47,13 +47,20 @@ def _get_bertscorer():
             tok.build_inputs_with_special_tokens = build_inputs_with_special_tokens
     return _BERT_SCORER
 
-def generate_predictions(model, loader, tokenizer, max_length=128):
+def generate_predictions(model, loader, tokenizer, max_length=128, max_eval_steps = 10000):
     model.eval()
     model_for_gen = model.module if hasattr(model, "module") else model
     preds, refs = [], []
 
     with torch.no_grad():
-        for batch in loader:
+        loader_iter = iter(loader)
+        for step in range(max_eval_steps):
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                break # Both ranks should ideally hit this at the same time
+            if is_main_process() and step % 100 == 0:
+                logger.info(f"generate_predictions step {step}")
             batch = {k: v.to(device) for k, v in batch.items()}
 
             generated_ids = model_for_gen.generate(
@@ -64,7 +71,16 @@ def generate_predictions(model, loader, tokenizer, max_length=128):
             )
 
             pred_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-            ref_text = tokenizer.batch_decode(batch["labels"], skip_special_tokens=True)
+            labels = batch["labels"]
+            if (labels == -100).any():
+                pad_id = tokenizer.pad_token_id
+                if pad_id is None:
+                    pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+                labels = labels.masked_fill(labels == -100, pad_id)
+            ref_text = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+            # print(pred_text)
+            # print(ref_text)
 
             preds.extend(pred_text)
             refs.extend(ref_text)
@@ -183,6 +199,21 @@ def compute_min_steps_per_epoch(cache_dir, batch_size, num_workers):
         dist.all_reduce(t, op=dist.ReduceOp.MIN)
         return int(t.item())
     return int(local_steps)
+
+def compute_stream_steps_per_epoch(path, batch_size, world_size):
+    # Count total lines in the dataset file (one sample per line).
+    with open(path, "rb") as f:
+        total_lines = 0
+        buf_size = 1024 * 1024
+        while True:
+            data = f.read(buf_size)
+            if not data:
+                break
+            total_lines += data.count(b"\n")
+    if total_lines == 0:
+        return 0
+    global_batch = batch_size * world_size
+    return max(1, total_lines // global_batch)
 
 def is_dist_avail_and_initialized():
     return dist.is_available() and dist.is_initialized()
@@ -354,6 +385,17 @@ if __name__ == "__main__":
         steps_per_epoch = compute_min_steps_per_epoch(cache_dir, batch_size=32, num_workers=4)
         if is_main_process():
             logger.info(f"Using steps_per_epoch={steps_per_epoch} (min across ranks)")
+    elif steps_per_epoch <= 0 and use_ddp and dataset_mode == "stream":
+        if is_main_process():
+            steps_per_epoch = compute_stream_steps_per_epoch(
+                train_datapath, batch_size=32, world_size=dist.get_world_size()
+            )
+            logger.info(f"Using steps_per_epoch={steps_per_epoch} (stream count)")
+        if use_ddp:
+            if is_dist_avail_and_initialized():
+                t = torch.tensor(steps_per_epoch, device=device)
+                dist.broadcast(t, src=0)
+                steps_per_epoch = int(t.item())
     elif steps_per_epoch <= 0 and use_ddp and is_main_process():
         logger.warning("DDP is enabled but STEPS_PER_EPOCH is not set; ranks may desync on iterable data.")
 
